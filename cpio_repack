@@ -1,0 +1,320 @@
+#!/usr/bin/env python3
+#
+# obs-service-cpio-repack
+#
+# Reads Name and Version from a spec file using rpmspec (honouring all RPM
+# macros including %include), then repacks an obscpio archive as a
+# conventionally named <name>-<version>.tar.<compression> tarball.
+#
+# All files required by %include directives in the spec must already be
+# present in the working directory. This script makes no attempt to locate
+# or fetch them.
+#
+# (C) 2025 SUSE LLC
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+from __future__ import annotations
+
+import argparse
+import glob
+import os
+import subprocess
+import sys
+import tarfile
+import tempfile
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def die(msg: str) -> None:
+    print(f"ERROR: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def resolve_glob(pattern: str, label: str) -> str:
+    """Expand *pattern* and return exactly one match, or die."""
+    # Also check _service:-prefixed copies that OBS may have left in cwd
+    matches = glob.glob(pattern) or glob.glob(f"_service:*:{pattern}")
+    if len(matches) == 0:
+        die(f"no file matched {label} glob '{pattern}'")
+    if len(matches) > 1:
+        die(f"ambiguous {label} glob '{pattern}' matched: {' '.join(matches)}")
+    return matches[0]
+
+
+def query_spec(spec_path: str) -> tuple[str, str]:
+    """
+    Return (name, version) by running rpmspec against *spec_path*.
+
+    _sourcedir is forced to cwd so that %include paths resolve against the
+    flat working directory layout that extract_file produces.
+    """
+    cmd = [
+        "rpmspec",
+        "--define", f"_sourcedir {os.getcwd()}",
+        "-q",
+        "--queryformat", "%{NAME} %{VERSION}\n",
+        spec_path,
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        die("rpmspec not found — install the 'rpm-build' package")
+    except subprocess.CalledProcessError as exc:
+        die(
+            f"rpmspec failed (exit {exc.returncode}):\n"
+            f"{exc.stderr.strip()}"
+        )
+
+    # rpmspec may emit one line per subpackage; all share the same Name/Version
+    # so the first non-empty line is sufficient.
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) >= 2:
+            return parts[0], parts[1]
+
+    die(f"rpmspec produced no usable NAME/VERSION output from '{spec_path}'")
+
+
+def extract_cpio(archive: str, destdir: str) -> None:
+    """Extract a newc cpio archive into *destdir*."""
+    abs_archive = os.path.abspath(archive)
+    cmd = ["cpio", "--extract", "--make-directories",
+           "--no-absolute-filenames", "--quiet"]
+    try:
+        with open(abs_archive, "rb") as fh:
+            subprocess.run(
+                cmd,
+                stdin=fh,
+                cwd=destdir,
+                check=True,
+                stderr=subprocess.PIPE,
+            )
+    except FileNotFoundError:
+        die("cpio not found — install the 'cpio' package")
+    except subprocess.CalledProcessError as exc:
+        die(
+            f"cpio extraction failed (exit {exc.returncode}):\n"
+            f"{exc.stderr.decode(errors='replace').strip()}"
+        )
+
+
+def toplevel_dir(destdir: str) -> str:
+    """
+    Return the single top-level directory name inside *destdir*, or die if
+    there is not exactly one.
+    """
+    entries = os.listdir(destdir)
+    dirs = [e for e in entries if os.path.isdir(os.path.join(destdir, e))]
+    if len(dirs) == 0:
+        die("cpio archive contained no top-level directory")
+    if len(dirs) > 1:
+        die(
+            f"cpio archive contained multiple top-level entries "
+            f"({', '.join(sorted(dirs))}); cannot determine which to rename"
+        )
+    return dirs[0]
+
+
+# Compression format → tarfile open mode for gz/bz2/xz.
+# zst is intentionally absent: tarfile has no zst support; it is handled
+# separately in create_tarball() via the system zstd binary.
+_TARFILE_COMPRESSION_MAP: dict[str, str] = {
+    "gz":  "w:gz",
+    "bz2": "w:bz2",
+    "xz":  "w:xz",
+}
+
+
+def create_tarball(srcdir: str, toplevel: str, outpath: str,
+                   compression: str) -> None:
+    """
+    Pack *srcdir*/*toplevel* into *outpath*.
+
+    gz/bz2/xz: Python's tarfile module.
+    zst:        tar | zstd pipeline via subprocess — tarfile has no zst support.
+                Mirrors the pipeline used by obs-service-recompress.
+    """
+    if compression == "zst":
+        # Pipe uncompressed tar output through zstd.
+        # tar stderr is redirected to DEVNULL to avoid a deadlock: with
+        # stdout consumed by zstd and stderr blocked on a full pipe buffer,
+        # tar_proc.wait() would never return.
+        tar_cmd = [
+            "tar", "--create", "--file=-",
+            f"--directory={srcdir}", toplevel,
+        ]
+        zst_cmd = [
+            "zstd", "--rsyncable", "-15", "--threads=0", "-c", "-",
+        ]
+        try:
+            tar_proc = subprocess.Popen(
+                tar_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+            with open(outpath, "wb") as out_fh:
+                subprocess.run(
+                    zst_cmd,
+                    stdin=tar_proc.stdout,
+                    stdout=out_fh,
+                    stderr=subprocess.PIPE,
+                    check=True,
+                )
+            tar_proc.wait()
+            if tar_proc.returncode != 0:
+                die(f"tar failed (exit {tar_proc.returncode})")
+        except FileNotFoundError as exc:
+            die(f"required binary not found: {exc.filename}")
+        except subprocess.CalledProcessError as exc:
+            die(
+                f"zstd failed (exit {exc.returncode}):\n"
+                f"{exc.stderr.decode(errors='replace').strip()}"
+            )
+        return
+
+    mode = _TARFILE_COMPRESSION_MAP[compression]
+    with tarfile.open(outpath, mode) as tf:
+        tf.add(os.path.join(srcdir, toplevel), arcname=toplevel)
+
+
+def contents_identical(path_a: str, path_b: str) -> bool:
+    """
+    Return True when the two tarballs expand to the same file tree.
+    Mirrors the diff-based idempotency check in obs-service-recompress.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        dir_a = os.path.join(tmpdir, "a")
+        dir_b = os.path.join(tmpdir, "b")
+        os.makedirs(dir_a)
+        os.makedirs(dir_b)
+        try:
+            subprocess.run(
+                ["tar", "--extract", f"--file={path_a}", f"--directory={dir_a}"],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            subprocess.run(
+                ["tar", "--extract", f"--file={path_b}", f"--directory={dir_b}"],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except subprocess.CalledProcessError:
+            return False
+        result = subprocess.run(
+            ["diff", "--recursive", "--no-dereference", dir_a, dir_b],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        return result.returncode == 0
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Repack an obscpio archive as a versioned source tarball. "
+            "Name and Version are read from a spec file via rpmspec."
+        )
+    )
+    parser.add_argument(
+        "--outdir", required=True,
+        help="Directory where the output tarball is written (provided by OBS).",
+    )
+    parser.add_argument(
+        "--archive", default="*.obscpio",
+        help="Glob matching the input .obscpio file. Default: *.obscpio",
+    )
+    parser.add_argument(
+        "--spec", default="*.spec",
+        help="Glob matching the .spec file to query. Default: *.spec",
+    )
+    parser.add_argument(
+        "--compression", default="bz2",
+        choices=["gz", "bz2", "xz", "zst"],
+        help="Output compression format. Default: bz2",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    # -- resolve inputs -------------------------------------------------------
+    archive = resolve_glob(args.archive, "archive")
+    spec    = resolve_glob(args.spec,    "spec")
+
+    print(f"Archive : {archive}")
+    print(f"Spec    : {spec}")
+
+    # -- query name + version via rpmspec ------------------------------------
+    name, version = query_spec(spec)
+    print(f"Name    : {name}")
+    print(f"Version : {version}")
+
+    # -- determine output filename -------------------------------------------
+    out_name     = f"{name}-{version}.tar.{args.compression}"
+    out_path     = os.path.join(args.outdir, out_name)
+    # Snapshot existence *before* writing anything — when outdir == cwd the
+    # output path and the pre-existing path are identical, so this must be
+    # checked before any new file is created.
+    existing     = os.path.join(os.getcwd(), out_name)
+    had_existing = os.path.isfile(existing)
+
+    # -- extract cpio into a temp directory ----------------------------------
+    with tempfile.TemporaryDirectory() as extract_dir:
+        extract_cpio(archive, extract_dir)
+
+        top = toplevel_dir(extract_dir)
+
+        # rename top-level dir to <name>-<version> if it differs
+        canonical = f"{name}-{version}"
+        if top != canonical:
+            os.rename(
+                os.path.join(extract_dir, top),
+                os.path.join(extract_dir, canonical),
+            )
+            print(f"Renamed '{top}' → '{canonical}'")
+            top = canonical
+
+        # Stage the tarball to a temp file in outdir so that:
+        #   - os.replace() is atomic (same filesystem as final destination)
+        #   - the idempotency check never compares a file against itself
+        #   - a failed create_tarball leaves no partial output at out_path
+        with tempfile.NamedTemporaryFile(
+            dir=args.outdir,
+            prefix=f".{out_name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as tmp_fh:
+            tmp_path = tmp_fh.name
+
+        try:
+            create_tarball(extract_dir, top, tmp_path, args.compression)
+
+            # -- idempotency check --------------------------------------------
+            # If an identical tarball already existed in cwd (previous run),
+            # discard the new one to avoid a spurious OBS source commit.
+            if had_existing and contents_identical(tmp_path, existing):
+                print(f"Identical tarball '{out_name}' already exists, skipping.")
+            else:
+                os.replace(tmp_path, out_path)
+                print(f"Repacked '{archive}' → '{out_name}'")
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+
+if __name__ == "__main__":
+    main()
