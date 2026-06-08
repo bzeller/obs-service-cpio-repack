@@ -20,10 +20,7 @@ License:        GPL-2.0-or-later
 URL:            https://github.com/bzeller/obs-service-cpio-repack
 BuildArch:      noarch
 
-# Sources are maintained directly in OBS — no SCM service needed for this
-# small self-contained package.
-Source0:        cpio_repack
-Source1:        cpio_repack.service
+Source:         %{name}-%{version}.tar.bz2
 
 # rpmspec is provided by rpm-build
 Requires:       python3
@@ -51,17 +48,17 @@ Any OBS project can use this service by adding:
 to the consuming spec file and using mode="buildtime" in _service.
 
 %prep
-# nothing to prepare — sources are plain files
+%autosetup
 
 %build
 # nothing to build — pure Python, no compilation
 
 %install
-install -D -m 0755 %{SOURCE0} %{buildroot}%{_prefix}/lib/obs/service/cpio_repack
-install -D -m 0644 %{SOURCE1} %{buildroot}%{_prefix}/lib/obs/service/cpio_repack.service
+install -D -m 0755 cpio_repack %{buildroot}%{_prefix}/lib/obs/service/cpio_repack
+install -D -m 0644 cpio_repack.service %{buildroot}%{_prefix}/lib/obs/service/cpio_repack.service
 
 %check
-python3 -m py_compile %{SOURCE0}
+python3 -m py_compile cpio_repack
 
 %files
 %{_prefix}/lib/obs/service/cpio_repack
