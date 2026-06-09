@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# obs-service-cpio-repack
+# obs-service-cpio_repack
 #
 # Reads Name and Version from a spec file using rpmspec (honouring all RPM
 # macros including %include), then repacks an obscpio archive as a

@@ -1,4 +1,4 @@
-# obs-service-cpio-repack
+# obs-service-cpio_repack
 
 An [OBS source service](https://openbuildservice.org/help/manuals/obs-user-guide/cha-obs-source-services) that repacks an `obscpio` archive produced by `obs_scm` into a conventionally named `<name>-<version>.tar.<compression>` source tarball, where `name` and `version` are read directly from the spec file using `rpmspec`.
 
@@ -35,7 +35,7 @@ In your `_service` file, replace the `tar` + `recompress` pair with:
 Add to your spec file:
 
 ```spec
-BuildRequires: obs-service-cpio-repack
+BuildRequires: obs-service-cpio_repack
 ```
 
 ### Parameters
@@ -46,7 +46,7 @@ BuildRequires: obs-service-cpio-repack
 | `spec` | `*.spec` | Glob matching the spec file to query for `Name` and `Version`. Must resolve to exactly one file. |
 | `compression` | `bz2` | Output compression format: `gz`, `bz2`, `xz`, or `zst`. |
 
-## Requirements
+# Requirements
 
 | Dependency | Provided by |
 |---|---|

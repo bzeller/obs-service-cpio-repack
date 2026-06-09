@@ -1,5 +1,5 @@
 #
-# spec file for package obs-service-cpio-repack
+# spec file for package obs-service-cpio_repack
 #
 # Copyright (c) 2025 SUSE LLC
 #
@@ -12,12 +12,12 @@
 # license that conforms to the Open Source Definition (Version 1.9)
 # published by the Open Source Initiative.
 
-Name:           obs-service-cpio-repack
+Name:           obs-service-cpio_repack
 Version:        0.1.0
 Release:        0
 Summary:        OBS source service: repack an obscpio as a versioned source tarball
 License:        GPL-2.0-or-later
-URL:            https://github.com/bzeller/obs-service-cpio-repack
+URL:            https://github.com/bzeller/obs-service-cpio_repack
 BuildArch:      noarch
 
 Source:         %{name}-%{version}.tar.bz2
@@ -43,7 +43,7 @@ before packing, matching the layout expected by %%autosetup / %%setup -n.
 No server-side installation or administrator privileges are required.
 Any OBS project can use this service by adding:
 
-  BuildRequires: obs-service-cpio-repack
+  BuildRequires: obs-service-cpio_repack
 
 to the consuming spec file and using mode="buildtime" in _service.
 
