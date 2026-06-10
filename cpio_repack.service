@@ -1,26 +1,20 @@
 <service name="cpio_repack">
-  <summary>Repack an obscpio archive as a versioned source tarball</summary>
+  <summary>Repack an obs_scm source tree as a versioned source tarball</summary>
   <description>
     Reads Name and Version from a spec file using rpmspec, honouring all RPM
-    macros including %include chains. Repacks the obscpio content as a
-    conventionally named &lt;name&gt;-&lt;version&gt;.tar.&lt;compression&gt;
-    tarball, renaming the top-level directory inside the archive to match.
+    macros including %include chains. Locates the source tree extracted by
+    obs_scm via the .obsinfo file, renames the top-level directory to
+    &lt;name&gt;-&lt;version&gt;, and packs it as a conventionally named
+    &lt;name&gt;-&lt;version&gt;.tar.&lt;compression&gt; tarball.
 
-    All files required by %include directives in the spec (e.g. version.inc
-    files) must already be present in the working directory. This service
-    makes no attempt to locate or fetch them — use obs_scm + extract_file
-    before this service to ensure they are available.
+    All files referenced by %include directives in the spec (e.g. version.inc
+    files) must already be present in the working directory. Use obs_scm +
+    extract_file before this service to ensure they are available.
 
     Designed for use with mode="buildtime". No server-side installation or
     administrator privileges are required; add BuildRequires on the
     obs-service-cpio_repack package in your project.
   </description>
-  <parameter name="archive">
-    <description>
-      Glob pattern matching the input .obscpio file.
-      Default: *.obscpio
-    </description>
-  </parameter>
   <parameter name="spec">
     <description>
       Glob pattern matching the .spec file to query for Name and Version.

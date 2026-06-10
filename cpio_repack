@@ -3,8 +3,14 @@
 # obs-service-cpio_repack
 #
 # Reads Name and Version from a spec file using rpmspec (honouring all RPM
-# macros including %include), then repacks an obscpio archive as a
-# conventionally named <name>-<version>.tar.<compression> tarball.
+# macros including %include), then produces a conventionally named
+# <name>-<version>.tar.<compression> source tarball from the source tree
+# that obs_scm has already extracted into the working directory.
+#
+# Source directory discovery uses the .obsinfo file written by obs_scm —
+# the same mechanism used by obs-service-tar_scm's 'tar' service. The
+# .obsinfo file is always present in both the OBS server-side package
+# directory and the buildtime build root.
 #
 # All files required by %include directives in the spec must already be
 # present in the working directory. This script makes no attempt to locate
@@ -35,13 +41,22 @@ def die(msg: str) -> None:
 
 def resolve_glob(pattern: str, label: str) -> str:
     """Expand *pattern* and return exactly one match, or die."""
-    # Also check _service:-prefixed copies that OBS may have left in cwd
     matches = glob.glob(pattern) or glob.glob(f"_service:*:{pattern}")
     if len(matches) == 0:
         die(f"no file matched {label} glob '{pattern}'")
     if len(matches) > 1:
         die(f"ambiguous {label} glob '{pattern}' matched: {' '.join(matches)}")
     return matches[0]
+
+
+def read_obsinfo(obsinfo_path: str, key: str) -> str:
+    """Read a single key from a .obsinfo file. Returns '' if key absent."""
+    with open(obsinfo_path) as fh:
+        for line in fh:
+            k, _, v = line.partition(":")
+            if k.strip() == key:
+                return v.strip()
+    return ""
 
 
 def query_spec(spec_path: str) -> tuple[str, str]:
@@ -85,46 +100,6 @@ def query_spec(spec_path: str) -> tuple[str, str]:
             return parts[0], parts[1]
 
     die(f"rpmspec produced no usable NAME/VERSION output from '{spec_path}'")
-
-
-def extract_cpio(archive: str, destdir: str) -> None:
-    """Extract a newc cpio archive into *destdir*."""
-    abs_archive = os.path.abspath(archive)
-    cmd = ["cpio", "--extract", "--make-directories",
-           "--no-absolute-filenames", "--quiet"]
-    try:
-        with open(abs_archive, "rb") as fh:
-            subprocess.run(
-                cmd,
-                stdin=fh,
-                cwd=destdir,
-                check=True,
-                stderr=subprocess.PIPE,
-            )
-    except FileNotFoundError:
-        die("cpio not found — install the 'cpio' package")
-    except subprocess.CalledProcessError as exc:
-        die(
-            f"cpio extraction failed (exit {exc.returncode}):\n"
-            f"{exc.stderr.decode(errors='replace').strip()}"
-        )
-
-
-def toplevel_dir(destdir: str) -> str:
-    """
-    Return the single top-level directory name inside *destdir*, or die if
-    there is not exactly one.
-    """
-    entries = os.listdir(destdir)
-    dirs = [e for e in entries if os.path.isdir(os.path.join(destdir, e))]
-    if len(dirs) == 0:
-        die("cpio archive contained no top-level directory")
-    if len(dirs) > 1:
-        die(
-            f"cpio archive contained multiple top-level entries "
-            f"({', '.join(sorted(dirs))}); cannot determine which to rename"
-        )
-    return dirs[0]
 
 
 # Compression format → tarfile open mode for gz/bz2/xz.
@@ -224,8 +199,9 @@ def contents_identical(path_a: str, path_b: str) -> bool:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Repack an obscpio archive as a versioned source tarball. "
-            "Name and Version are read from a spec file via rpmspec."
+            "Repack an obs_scm source tree as a versioned source tarball. "
+            "The source directory is located via the .obsinfo file written "
+            "by obs_scm. Name and Version are read from a spec file via rpmspec."
         )
     )
     parser.add_argument(
@@ -233,12 +209,9 @@ def parse_args() -> argparse.Namespace:
         help="Directory where the output tarball is written (provided by OBS).",
     )
     parser.add_argument(
-        "--archive", default="*.obscpio",
-        help="Glob matching the input .obscpio file. Default: *.obscpio",
-    )
-    parser.add_argument(
         "--spec", default="*.spec",
-        help="Glob matching the .spec file to query. Default: *.spec",
+        help="Glob matching the .spec file to query for Name and Version. "
+             "Default: *.spec",
     )
     parser.add_argument(
         "--compression", default="bz2",
@@ -251,69 +224,85 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    # -- resolve inputs -------------------------------------------------------
-    archive = resolve_glob(args.archive, "archive")
-    spec    = resolve_glob(args.spec,    "spec")
+    # -- locate .obsinfo ------------------------------------------------------
+    # obs_scm always writes a <name>.obsinfo alongside the .obscpio.
+    # At buildtime the .obscpio is gone but .obsinfo remains — it is the
+    # authoritative record of what was extracted and under what name.
+    obsinfo = resolve_glob("*.obsinfo", "obsinfo")
+    print(f"Obsinfo : {obsinfo}")
 
-    print(f"Archive : {archive}")
+    obs_name    = read_obsinfo(obsinfo, "name")
+    obs_version = read_obsinfo(obsinfo, "version")
+    if not obs_name:
+        die(f"could not read 'name' from '{obsinfo}'")
+
+    # The source tree directory is named <name>-<version> when obs_scm
+    # appends a version (the default), or just <name> when without-version
+    # is set. Try the versioned form first.
+    src_dir = f"{obs_name}-{obs_version}" if obs_version else obs_name
+    if not os.path.isdir(src_dir):
+        if os.path.isdir(obs_name):
+            src_dir = obs_name
+        else:
+            die(
+                f"source directory '{src_dir}' not found in cwd "
+                f"(obsinfo: name='{obs_name}' version='{obs_version}')"
+            )
+    print(f"Source  : {src_dir}/")
+
+    # -- query Name + Version from spec ---------------------------------------
+    spec = resolve_glob(args.spec, "spec")
     print(f"Spec    : {spec}")
 
-    # -- query name + version via rpmspec ------------------------------------
     name, version = query_spec(spec)
     print(f"Name    : {name}")
     print(f"Version : {version}")
 
-    # -- determine output filename -------------------------------------------
-    out_name     = f"{name}-{version}.tar.{args.compression}"
-    out_path     = os.path.join(args.outdir, out_name)
-    # Snapshot existence *before* writing anything — when outdir == cwd the
-    # output path and the pre-existing path are identical, so this must be
-    # checked before any new file is created.
-    existing     = os.path.join(os.getcwd(), out_name)
-    had_existing = os.path.isfile(existing)
+    # -- determine output filename --------------------------------------------
+    canonical = f"{name}-{version}"
+    out_name  = f"{canonical}.tar.{args.compression}"
+    out_path  = os.path.join(args.outdir, out_name)
 
-    # -- extract cpio into a temp directory ----------------------------------
-    with tempfile.TemporaryDirectory() as extract_dir:
-        extract_cpio(archive, extract_dir)
+    # Snapshot existence in outdir *before* writing anything.
+    had_existing = os.path.isfile(out_path)
 
-        top = toplevel_dir(extract_dir)
+    # -- rename source directory to canonical <name>-<version> ---------------
+    if src_dir != canonical:
+        os.rename(src_dir, canonical)
+        print(f"Renamed '{src_dir}' → '{canonical}'")
+        src_dir = canonical
 
-        # rename top-level dir to <name>-<version> if it differs
-        canonical = f"{name}-{version}"
-        if top != canonical:
-            os.rename(
-                os.path.join(extract_dir, top),
-                os.path.join(extract_dir, canonical),
-            )
-            print(f"Renamed '{top}' → '{canonical}'")
-            top = canonical
+    # -- pack into a staging temp file ----------------------------------------
+    # Written to outdir so os.replace() is atomic (same filesystem).
+    # A failed create_tarball leaves no partial file at out_path.
+    with tempfile.NamedTemporaryFile(
+        dir=args.outdir,
+        prefix=f".{out_name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as tmp_fh:
+        tmp_path = tmp_fh.name
 
-        # Stage the tarball to a temp file in outdir so that:
-        #   - os.replace() is atomic (same filesystem as final destination)
-        #   - the idempotency check never compares a file against itself
-        #   - a failed create_tarball leaves no partial output at out_path
-        with tempfile.NamedTemporaryFile(
-            dir=args.outdir,
-            prefix=f".{out_name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as tmp_fh:
-            tmp_path = tmp_fh.name
+    try:
+        create_tarball(os.getcwd(), src_dir, tmp_path, args.compression)
 
-        try:
-            create_tarball(extract_dir, top, tmp_path, args.compression)
+        # -- idempotency check ------------------------------------------------
+        # If an identical tarball already exists in outdir (previous service
+        # run), discard the new one to avoid a spurious OBS source commit.
+        if had_existing and contents_identical(tmp_path, out_path):
+            print(f"Identical tarball '{out_name}' already exists, skipping.")
+        else:
+            os.replace(tmp_path, out_path)
+            print(f"Produced '{out_name}'")
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
-            # -- idempotency check --------------------------------------------
-            # If an identical tarball already existed in cwd (previous run),
-            # discard the new one to avoid a spurious OBS source commit.
-            if had_existing and contents_identical(tmp_path, existing):
-                print(f"Identical tarball '{out_name}' already exists, skipping.")
-            else:
-                os.replace(tmp_path, out_path)
-                print(f"Repacked '{archive}' → '{out_name}'")
-        finally:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
+    # -- restore source directory name ----------------------------------------
+    # Rename back so the build root is not left in a modified state for
+    # subsequent services or rpmbuild's %prep step.
+    if src_dir != (f"{obs_name}-{obs_version}" if obs_version else obs_name):
+        os.rename(src_dir, f"{obs_name}-{obs_version}" if obs_version else obs_name)
 
 
 if __name__ == "__main__":
