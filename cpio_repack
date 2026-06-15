@@ -292,6 +292,10 @@ def main() -> None:
         if had_existing and contents_identical(tmp_path, out_path):
             print(f"Identical tarball '{out_name}' already exists, skipping.")
         else:
+            # Ensure standard 0644 permissions before moving into place.
+            # NamedTemporaryFile creates files with mode 0600 which would
+            # trigger rpmlint's strange-permission warning on the source tarball.
+            os.chmod(tmp_path, 0o644)
             os.replace(tmp_path, out_path)
             print(f"Produced '{out_name}'")
     finally:
